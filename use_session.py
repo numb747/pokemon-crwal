@@ -18,6 +18,13 @@
     python use_session.py --show           # 有窗口查看（调试用）
     python use_session.py /order           # 直达其它受保护页（传路径即可）
     python use_session.py --target /plan/8 # 同上，显式指定目标
+
+订购流程（在 /plan/8 上执行）：
+    python use_session.py --order                      # 选“每月付款”，走到“立即订购”前停下（不真正下单）
+    python use_session.py --order --coupon ABC123      # 同上，并填入优惠码 ABC123 后点“使用”
+    python use_session.py --order --cycle 季度付款      # 改选付款周期（每月/季度/半年/年度付款）
+    python use_session.py --order --coupon ABC123 --confirm  # 真正点击“立即订购”下单
+    #   ↑ 安全阀：默认不点“立即订购”，只把表单准备好；加 --confirm 才真正下单。
 """
 
 import os
@@ -32,8 +39,65 @@ BASE = "https://web1.52pokemon66.cc"
 DEFAULT_TARGET = "/plan/8"
 SESSION_FILE = "session_state.json"
 
+# 订购页选择器（已从 /plan/8 实测确认）：
+#   付款周期行：.price-option-row（用文本“每月付款/季度付款/…”过滤定位）
+#   优惠码输入框：input[placeholder=输入优惠码]
+#   优惠码“使用”按钮：.coupon-card__submit
+#   “立即订购”按钮：.order-action-btn（未选周期时 disabled，选中后变可用）
+CYCLE_ROW = ".price-option-row"
+COUPON_INPUT = "input[placeholder='输入优惠码']"
+COUPON_SUBMIT = ".coupon-card__submit"
+ORDER_BTN = ".order-action-btn"
 
-def main(show_window: bool, target: str):
+
+def do_order(page, cycle: str, coupon: str, confirm: bool):
+    """在 /plan/8 上：选付款周期 → （可选）填优惠码并点“使用” → 走到/点击“立即订购”。"""
+    # 1) 选择付款周期（点击整行，整行 cursor:pointer）
+    row = page.locator(CYCLE_ROW).filter(has_text=cycle).first
+    try:
+        row.wait_for(state="visible", timeout=8000)
+    except Exception:
+        print(f"未找到付款周期“{cycle}”。可选：每月付款/季度付款/半年付款/年度付款。")
+        return
+    row.click()
+    print(f"已选择付款周期：{cycle}")
+    page.wait_for_timeout(600)
+
+    # 2) 优惠码（可选）：填入后点“使用”，让站点校验适用周期
+    if coupon:
+        field = page.locator(COUPON_INPUT)
+        field.wait_for(state="visible", timeout=8000)
+        field.click()
+        field.fill("")
+        field.type(coupon, delay=40)   # 真实键盘输入，避开 isTrusted 检测
+        page.locator(COUPON_SUBMIT).click()
+        print(f"已填入优惠码并点击“使用”：{coupon}")
+        page.wait_for_timeout(1200)    # 等待后端校验返回
+
+    # 3) 立即订购
+    order = page.locator(ORDER_BTN)
+    try:
+        order.wait_for(state="visible", timeout=8000)
+    except Exception:
+        print("未找到“立即订购”按钮，流程终止。")
+        return
+    if order.is_disabled():
+        print("“立即订购”仍不可用（可能周期未选中或优惠码校验未通过），未下单。")
+        return
+
+    if confirm:
+        order.click()
+        print("已点击“立即订购”，正在提交订单……")
+        page.wait_for_timeout(2500)
+        print(f"点击后当前页面：{page.url}")
+    else:
+        print("表单已就绪，“立即订购”可点击。安全阀生效：未真正下单。")
+        print("如需真正提交，请加 --confirm 参数。")
+
+
+def main(show_window: bool, target: str,
+         do_order_flow: bool = False, cycle: str = "每月付款",
+         coupon: str = "", confirm: bool = False):
     if not os.path.exists(SESSION_FILE):
         print(f"找不到 {SESSION_FILE}，请先运行：python login.py --submit")
         sys.exit(1)
@@ -94,6 +158,13 @@ def main(show_window: bool, target: str):
             if target.strip("/") not in current:
                 print(f"提示：期望进入 {target}，实际停在上面地址，可能该路径已变化。")
 
+            # 会话有效且请求了订购流程时执行（需在 /plan/8 这类订购页上）
+            if do_order_flow:
+                if "/plan/" not in current:
+                    print(f"当前页 {current} 不是套餐订购页，订购流程需在 /plan/8 上执行。")
+                else:
+                    do_order(page, cycle=cycle, coupon=coupon, confirm=confirm)
+
         if show_window:
             print("有窗口模式：保持打开，按回车结束。")
             input()
@@ -101,17 +172,27 @@ def main(show_window: bool, target: str):
         browser.close()
 
 
+def _opt_value(args, name, default=None):
+    """取 `--name value` 形式的参数值，没有则返回 default。"""
+    if name in args:
+        i = args.index(name)
+        if i + 1 < len(args):
+            return args[i + 1]
+    return default
+
+
 if __name__ == "__main__":
     args = sys.argv[1:]
     # 目标路径：可用 --target /xxx 指定，或直接把一个以 / 开头的参数当路径；默认 /plan/8
-    target = DEFAULT_TARGET
-    if "--target" in args:
-        i = args.index("--target")
-        if i + 1 < len(args):
-            target = args[i + 1]
-    else:
-        for a in args:
-            if a.startswith("/"):
-                target = a
-                break
-    main(show_window="--show" in args, target=target)
+    target = _opt_value(args, "--target")
+    if target is None:
+        target = next((a for a in args if a.startswith("/")), DEFAULT_TARGET)
+
+    main(
+        show_window="--show" in args,
+        target=target,
+        do_order_flow="--order" in args,
+        cycle=_opt_value(args, "--cycle", "每月付款"),
+        coupon=_opt_value(args, "--coupon", ""),
+        confirm="--confirm" in args,
+    )
