@@ -1,0 +1,9 @@
+# 本地凭证与会话 token，切勿提交
+credentials.py
+session_state.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
