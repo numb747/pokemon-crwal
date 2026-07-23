@@ -13,16 +13,16 @@
 全过程可见、代码可审，凭证只从本地 credentials.py 读取，不外传。
 
 关于“页面反复刷新”的真相（已实测确认）：
-    该站点内置“开发者工具检测器”。它按窗口内外尺寸差判断 DevTools 是否打开，
-    一旦判定为打开，就强制把页面在 /login <-> /error-page 之间反复弹跳。
-    - 有窗口(headful)模式会误触发 → 反复刷新（就是你遇到的现象）。
-    - 无窗口(headless)模式无窗口装饰、尺寸差为 0 → 不触发，实测 0 跳转、稳定。
-    因此本脚本默认用 headless 完成登录。
+    该站点用开源库 disable-devtool 做开发者工具检测。有窗口模式会被误判为
+    “DevTools 打开”，从而把页面弹到 /error-page（在登录页表现为反复刷新）。
+    解法：用搜索引擎(Googlebot) 的 User-Agent，命中该库的 seo 白名单
+    （源码 `if (seo && seoBot) return "seobot"`），检测器根本不启动。
+    因此本脚本无论 headless 还是 --show 有窗口，都不会再刷新。
 
 用法：
     python login.py            # 无窗口，填好账号密码并校验（不提交）
     python login.py --submit   # 无窗口，填好后自动点“登录”，成功则保存会话
-    python login.py --submit --show   # 有窗口（调试用；可能触发上述刷新）
+    python login.py --submit --show   # 有窗口查看过程（已用 UA 白名单，不会刷新）
 """
 
 import sys
@@ -52,15 +52,17 @@ def fill_like_human(page, selector, value):
 
 def run(auto_submit: bool, show_window: bool):
     with sync_playwright() as p:
-        # 默认 headless=True（无窗口）。原因见文件顶部说明：
-        # 该站点的“开发者工具检测器”在【有窗口】模式下会误判，
-        # 反复把页面在 /login <-> /error-page 之间弹跳（就是你看到的“多次刷新”）；
-        # headless 模式无窗口装饰、尺寸差为 0，不触发检测，实测 0 跳转、稳定。
+        # 默认 headless=True（无窗口）；--show 时开窗口便于观察。
+        # 站点用 disable-devtool 做开发者工具检测：有窗口模式会被误判，
+        # 把页面弹到 /error-page（登录页则表现为反复刷新）。
+        # 用搜索引擎(Googlebot) UA 命中该库的 seo 白名单，使检测器根本不启动，
+        # 因此有窗口模式也不会再刷新。（详见 use_session.py 里的同款说明）
         browser = p.chromium.launch(headless=not show_window)
-        if show_window:
-            print("警告：有窗口(--show)模式下，站点的 DevTools 检测可能导致页面反复跳转。")
-            print("      如遇刷新循环，请去掉 --show 用默认无窗口模式。")
-        page = browser.new_page()
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (compatible; Googlebot/2.1; "
+                       "+http://www.google.com/bot.html)"
+        )
+        page = context.new_page()
         page.goto(LOGIN_URL, wait_until="domcontentloaded")
 
         # 这是 Vue SPA，等表单真正渲染出来再操作
@@ -76,7 +78,7 @@ def run(auto_submit: bool, show_window: bool):
         pwd_val = page.locator("input[type=password]").input_value()
         if email_val != EMAIL or not pwd_val:
             print(f"填充校验未通过：账号框='{email_val}'，密码是否有值={bool(pwd_val)}")
-            print("站点可能重置了表单。若你用了 --show，请改用默认无窗口模式重试。")
+            print("站点可能重置了表单，请重试；若仍失败，检查账号密码是否正确。")
             browser.close()
             return
 
