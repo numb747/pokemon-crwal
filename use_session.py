@@ -46,12 +46,7 @@ def main(show_window: bool, target: str):
         print("会话文件里没有 auth_data / user，可能上次登录未成功。请重新登录。")
         sys.exit(1)
 
-    # 构造一段在页面加载最早期执行的脚本：
-    #   1) 把登录态写回 localStorage（供路由守卫和 API 鉴权用）
-    #   2) 中和站点的 disable-devtool：不管哪个检测器触发，其最终动作都是
-    #      把页面导航到 /error-page。在最早期拦掉所有指向 error-page 的跳转，
-    #      检测可以继续跑，但“惩罚跳转”被无效化，页面稳定停在目标页。
-    #      （这让 --show 有窗口模式也不再出现 error-page → dashboard 的弹跳）
+    # 在页面加载最早期把登录态写回 localStorage（供路由守卫和 API 鉴权用）
     user_js = json.dumps(auth.get("user") or "")
     authdata_js = json.dumps(auth.get("auth_data") or "")
     init_script = f"""
@@ -61,33 +56,22 @@ def main(show_window: bool, target: str):
             if (u) localStorage.setItem('user', u);
             if (a) localStorage.setItem('auth_data', a);
         }} catch (e) {{}}
-        try {{
-            const isErr = (u) => typeof u === 'string' && u.indexOf('error-page') >= 0;
-            const _assign = Location.prototype.assign;
-            const _replace = Location.prototype.replace;
-            Location.prototype.assign = function(u) {{ if (isErr(u)) return; return _assign.call(this, u); }};
-            Location.prototype.replace = function(u) {{ if (isErr(u)) return; return _replace.call(this, u); }};
-            const _push = history.pushState, _rep = history.replaceState;
-            history.pushState = function(...a) {{ if (isErr(a[2])) return; return _push.apply(this, a); }};
-            history.replaceState = function(...a) {{ if (isErr(a[2])) return; return _rep.apply(this, a); }};
-            const hd = Object.getOwnPropertyDescriptor(Location.prototype, 'href');
-            if (hd && hd.set) {{
-                Object.defineProperty(location, 'href', {{
-                    get: hd.get.bind(location),
-                    set: (v) => {{ if (!isErr(v)) hd.set.call(location, v); }},
-                    configurable: true
-                }});
-            }}
-        }} catch (e) {{}}
     """
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=not show_window)
-        context = browser.new_page().context
+        # 用搜索引擎(Googlebot) UA：站点的 disable-devtool 配置了 seo:true，
+        # 检测到搜索引擎爬虫会直接放行、根本不启动检测器（库源码里的
+        # `if (seo && seoBot) return "seobot"` 白名单通道）。这样即便 --show
+        # 有窗口模式也不会再被弹到 /error-page。比拦跳转/爆破 token 都干净可靠。
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (compatible; Googlebot/2.1; "
+                       "+http://www.google.com/bot.html)"
+        )
         # 关键：init_script 在每个新文档的任何脚本之前运行，
         # 保证路由守卫读 localStorage 时 token 已就位。
         context.add_init_script(init_script)
-        page = context.pages[0]
+        page = context.new_page()
 
         target_url = BASE + target
         page.goto(target_url, wait_until="domcontentloaded")
