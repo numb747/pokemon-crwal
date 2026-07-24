@@ -25,6 +25,10 @@
     python use_session.py --order --cycle 季度付款      # 改选付款周期（每月/季度/半年/年度付款）
     python use_session.py --order --coupon ABC123 --confirm  # 真正点击“立即订购”下单
     #   ↑ 安全阀：默认不点“立即订购”，只把表单准备好；加 --confirm 才真正下单。
+
+获取通用订阅链接（在面板页 /main/dashboard 上执行）：
+    python use_session.py --sub    # 进面板页→关公告弹窗→点“复制通用订阅链接”→把链接打印到终端
+    #   --sub 时默认目标即面板页，无需再指定路径。
 """
 
 import os
@@ -48,6 +52,66 @@ CYCLE_ROW = ".price-option-row"
 COUPON_INPUT = "input[placeholder='输入优惠码']"
 COUPON_SUBMIT = ".coupon-card__submit"
 ORDER_BTN = ".order-action-btn"
+
+# 面板页（/main/dashboard）：进入会弹“系统公告”对话框，挡住下方按钮，
+# 需先关掉；“复制通用订阅链接”点击后会把链接写入剪贴板（不在任何 input/href 里，
+# 已实测确认），所以要授予剪贴板权限、点完再读剪贴板。
+DASHBOARD = "/main/dashboard"
+DISMISS_TODAY_BTN = "今日不再提醒"   # 持久屏蔽弹窗（比“关闭”更省事，下次不再弹）
+DIALOG_CLOSE_BTN = "关闭"
+COPY_SUB_BTN = "复制通用订阅链接"
+
+
+def do_subscribe(page):
+    """在 /main/dashboard 上：关掉公告弹窗 → 点“复制通用订阅链接” → 读剪贴板输出订阅链接。"""
+    # 1) 关弹窗：优先点“今日不再提醒”（持久屏蔽），失败再退回“关闭”
+    for name in (DISMISS_TODAY_BTN, DIALOG_CLOSE_BTN):
+        try:
+            btn = page.get_by_role("button", name=name).first
+            btn.wait_for(state="visible", timeout=4000)
+            btn.click()
+            print(f"已关闭公告弹窗（{name}）。")
+            page.wait_for_timeout(500)
+            break
+        except Exception:
+            continue
+    else:
+        print("未见公告弹窗（或已被屏蔽），继续。")
+
+    # 2) 点“复制通用订阅链接”→读剪贴板。真实链接是页面异步请求回来才填充的，
+    #    进页面就点会把初始占位（"default-url"）写进剪贴板，且剪贴板不会随数据
+    #    更新自动刷新——必须在数据就绪后重新点击。故这里循环“点击+读取”，
+    #    直到剪贴板里是真正的订阅 URL（http 开头）或超时。
+    try:
+        copy_btn = page.get_by_role("button", name=COPY_SUB_BTN).first
+        copy_btn.wait_for(state="visible", timeout=8000)
+    except Exception:
+        print("未找到“复制通用订阅链接”按钮，无法获取订阅链接。")
+        return
+
+    def read_clip():
+        try:
+            return (page.evaluate("() => navigator.clipboard.readText()") or "").strip()
+        except Exception:
+            return ""
+
+    sub_url = ""
+    for _ in range(15):            # 最多约 12 秒（15 × 800ms）
+        copy_btn.click()
+        page.wait_for_timeout(400)
+        sub_url = read_clip()
+        if sub_url.startswith("http"):
+            break
+        page.wait_for_timeout(400)
+
+    if sub_url.startswith("http"):
+        print("\n===== 通用订阅链接 =====")
+        print(sub_url)
+        print("========================")
+    elif sub_url:
+        print(f"剪贴板内容看起来不是订阅链接（拿到：{sub_url}）。可能站点未成功生成链接，请重试。")
+    else:
+        print("剪贴板为空，未能取到订阅链接。")
 
 
 def do_order(page, cycle: str, coupon: str, confirm: bool):
@@ -97,7 +161,8 @@ def do_order(page, cycle: str, coupon: str, confirm: bool):
 
 def main(show_window: bool, target: str,
          do_order_flow: bool = False, cycle: str = "每月付款",
-         coupon: str = "", confirm: bool = False):
+         coupon: str = "", confirm: bool = False,
+         do_sub_flow: bool = False):
     if not os.path.exists(SESSION_FILE):
         print(f"找不到 {SESSION_FILE}，请先运行：python login.py --submit")
         sys.exit(1)
@@ -130,7 +195,9 @@ def main(show_window: bool, target: str,
         # 有窗口模式也不会再被弹到 /error-page。比拦跳转/爆破 token 都干净可靠。
         context = browser.new_context(
             user_agent="Mozilla/5.0 (compatible; Googlebot/2.1; "
-                       "+http://www.google.com/bot.html)"
+                       "+http://www.google.com/bot.html)",
+            # 授予剪贴板读写权限：--sub 复制订阅链接后需要从剪贴板把它读出来。
+            permissions=["clipboard-read", "clipboard-write"],
         )
         # 关键：init_script 在每个新文档的任何脚本之前运行，
         # 保证路由守卫读 localStorage 时 token 已就位。
@@ -165,6 +232,13 @@ def main(show_window: bool, target: str,
                 else:
                     do_order(page, cycle=cycle, coupon=coupon, confirm=confirm)
 
+            # 会话有效且请求了订阅链接时执行（需在面板页 /dashboard 上）
+            if do_sub_flow:
+                if "dashboard" not in current:
+                    print(f"当前页 {current} 不是面板页，获取订阅链接需在 {DASHBOARD} 上执行。")
+                else:
+                    do_subscribe(page)
+
         if show_window:
             print("有窗口模式：保持打开，按回车结束。")
             input()
@@ -183,10 +257,15 @@ def _opt_value(args, name, default=None):
 
 if __name__ == "__main__":
     args = sys.argv[1:]
-    # 目标路径：可用 --target /xxx 指定，或直接把一个以 / 开头的参数当路径；默认 /plan/8
+    do_sub_flow = "--sub" in args
+
+    # 目标路径：显式 --target /xxx 或一个以 / 开头的参数最优先；
+    # 否则 --sub 默认去面板页 /main/dashboard，其余情况默认 /plan/8。
     target = _opt_value(args, "--target")
     if target is None:
-        target = next((a for a in args if a.startswith("/")), DEFAULT_TARGET)
+        target = next((a for a in args if a.startswith("/")), None)
+    if target is None:
+        target = DASHBOARD if do_sub_flow else DEFAULT_TARGET
 
     main(
         show_window="--show" in args,
@@ -195,4 +274,5 @@ if __name__ == "__main__":
         cycle=_opt_value(args, "--cycle", "每月付款"),
         coupon=_opt_value(args, "--coupon", ""),
         confirm="--confirm" in args,
+        do_sub_flow=do_sub_flow,
     )
