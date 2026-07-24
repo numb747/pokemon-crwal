@@ -27,8 +27,9 @@
     #   ↑ 安全阀：默认不点“立即订购”，只把表单准备好；加 --confirm 才真正下单。
 
 获取通用订阅链接（在面板页 /main/dashboard 上执行）：
-    python use_session.py --sub    # 进面板页→关公告弹窗→点“复制通用订阅链接”→把链接打印到终端
+    python use_session.py --sub    # 进面板页→直接读 localStorage.subscribe_url→打印到终端
     #   --sub 时默认目标即面板页，无需再指定路径。
+    #   （前端进页面会自行解密并把链接写入 localStorage，故无需点按钮/走剪贴板。）
 """
 
 import os
@@ -53,65 +54,39 @@ COUPON_INPUT = "input[placeholder='输入优惠码']"
 COUPON_SUBMIT = ".coupon-card__submit"
 ORDER_BTN = ".order-action-btn"
 
-# 面板页（/main/dashboard）：进入会弹“系统公告”对话框，挡住下方按钮，
-# 需先关掉；“复制通用订阅链接”点击后会把链接写入剪贴板（不在任何 input/href 里，
-# 已实测确认），所以要授予剪贴板权限、点完再读剪贴板。
+# 面板页（/main/dashboard）：进入后前端会自行请求接口、解密，并把解密后的
+# 订阅链接写入 localStorage 的 subscribe_url（已实测确认）。因此直接读该 key 即可，
+# 无需点“复制通用订阅链接”按钮、无需剪贴板——链接是前端解密后的最终真值，
+# 也天然免疫站点“动态分配订阅域名”（读的就是当前实际值）。
 DASHBOARD = "/main/dashboard"
-DISMISS_TODAY_BTN = "今日不再提醒"   # 持久屏蔽弹窗（比“关闭”更省事，下次不再弹）
-DIALOG_CLOSE_BTN = "关闭"
-COPY_SUB_BTN = "复制通用订阅链接"
+SUB_URL_KEY = "subscribe_url"
 
 
 def do_subscribe(page):
-    """在 /main/dashboard 上：关掉公告弹窗 → 点“复制通用订阅链接” → 读剪贴板输出订阅链接。"""
-    # 1) 关弹窗：优先点“今日不再提醒”（持久屏蔽），失败再退回“关闭”
-    for name in (DISMISS_TODAY_BTN, DIALOG_CLOSE_BTN):
+    """在 /main/dashboard 上：轮询 localStorage.subscribe_url，取到后打印订阅链接。"""
+    def read_sub():
         try:
-            btn = page.get_by_role("button", name=name).first
-            btn.wait_for(state="visible", timeout=4000)
-            btn.click()
-            print(f"已关闭公告弹窗（{name}）。")
-            page.wait_for_timeout(500)
-            break
-        except Exception:
-            continue
-    else:
-        print("未见公告弹窗（或已被屏蔽），继续。")
-
-    # 2) 点“复制通用订阅链接”→读剪贴板。真实链接是页面异步请求回来才填充的，
-    #    进页面就点会把初始占位（"default-url"）写进剪贴板，且剪贴板不会随数据
-    #    更新自动刷新——必须在数据就绪后重新点击。故这里循环“点击+读取”，
-    #    直到剪贴板里是真正的订阅 URL（http 开头）或超时。
-    try:
-        copy_btn = page.get_by_role("button", name=COPY_SUB_BTN).first
-        copy_btn.wait_for(state="visible", timeout=8000)
-    except Exception:
-        print("未找到“复制通用订阅链接”按钮，无法获取订阅链接。")
-        return
-
-    def read_clip():
-        try:
-            return (page.evaluate("() => navigator.clipboard.readText()") or "").strip()
+            v = page.evaluate(f"() => localStorage.getItem('{SUB_URL_KEY}')")
+            return (v or "").strip()
         except Exception:
             return ""
 
+    # 前端解密+写入是异步的，轮询等待直到出现 http 链接或超时（最多约 12 秒）。
     sub_url = ""
-    for _ in range(15):            # 最多约 12 秒（15 × 800ms）
-        copy_btn.click()
-        page.wait_for_timeout(400)
-        sub_url = read_clip()
+    for _ in range(24):
+        sub_url = read_sub()
         if sub_url.startswith("http"):
             break
-        page.wait_for_timeout(400)
+        page.wait_for_timeout(500)
 
     if sub_url.startswith("http"):
         print("\n===== 通用订阅链接 =====")
         print(sub_url)
         print("========================")
     elif sub_url:
-        print(f"剪贴板内容看起来不是订阅链接（拿到：{sub_url}）。可能站点未成功生成链接，请重试。")
+        print(f"localStorage.{SUB_URL_KEY} 尚未就绪（当前：{sub_url}）。可能链接未生成，请重试。")
     else:
-        print("剪贴板为空，未能取到订阅链接。")
+        print(f"未在 localStorage 找到 {SUB_URL_KEY}，未能取到订阅链接。请重试或检查会话有效性。")
 
 
 def do_order(page, cycle: str, coupon: str, confirm: bool):
@@ -195,9 +170,7 @@ def main(show_window: bool, target: str,
         # 有窗口模式也不会再被弹到 /error-page。比拦跳转/爆破 token 都干净可靠。
         context = browser.new_context(
             user_agent="Mozilla/5.0 (compatible; Googlebot/2.1; "
-                       "+http://www.google.com/bot.html)",
-            # 授予剪贴板读写权限：--sub 复制订阅链接后需要从剪贴板把它读出来。
-            permissions=["clipboard-read", "clipboard-write"],
+                       "+http://www.google.com/bot.html)"
         )
         # 关键：init_script 在每个新文档的任何脚本之前运行，
         # 保证路由守卫读 localStorage 时 token 已就位。
